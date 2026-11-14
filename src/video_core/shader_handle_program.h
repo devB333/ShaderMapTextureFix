@@ -17,9 +17,10 @@ namespace VideoCommon {
 /// bound constant buffer's address, 0 when none is bound. storage_alignment is the host storage
 /// buffer offset alignment: storage offsets in the program are relative to the buffer address
 /// aligned down to it (StorageOffset), which is also where the buffer cache binds the buffer.
+/// element is the descriptor's array element, for a handle each element reads at its own place.
 template <typename Memory, typename CbufAddress>
 u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_memory,
-                          CbufAddress&& cbuf_address, u64 storage_alignment) {
+                          CbufAddress&& cbuf_address, u64 storage_alignment, u32 element = 0) {
     const GPUVAddr storage_mask{~(GPUVAddr{(std::max)(storage_alignment, u64{1})} - 1)};
     return Shader::EvaluateHandleProgram(
                info.handle_programs[program],
@@ -44,7 +45,8 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                    }
                    base &= storage_mask;
                    return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
-               })
+               },
+               element)
         .value_or(0U);
 }
 

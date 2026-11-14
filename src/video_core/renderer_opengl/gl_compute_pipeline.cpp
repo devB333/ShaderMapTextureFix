@@ -120,7 +120,7 @@ void ComputePipeline::Configure() {
                                                   ? cbufs[cbuf].Address()
                                                   : GPUVAddr{};
                                    },
-                                   storage_buffer_alignment),
+                                   storage_buffer_alignment, index),
                                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);

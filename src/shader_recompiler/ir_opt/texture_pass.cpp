@@ -448,6 +448,21 @@ thread_local std::unordered_map<const IR::Inst*, u32> g_handle_slots;
 thread_local u32 g_handle_slot_count{};
 thread_local int g_handle_depth{};
 
+// A handle that no single evaluation gives because the shader reads it at an index it computes
+// (a light's shadow map, read from the light's record in a loop) is still one of an array of
+// handles: the program then computes the handle of one array element, with HandleOp::Element in
+// place of the index. Only an index scaled by a constant into the byte offset of the load the
+// handle comes from is taken, and not through a Phi, whose inputs don't reach the instruction.
+struct HandleElement {
+    bool allowed{};
+    int load_depth{};
+    int phi_depth{};
+    const IR::Inst* index{};
+};
+thread_local HandleElement g_handle_element;
+/// Elements of such an array: the records the shader can tell apart.
+constexpr u32 HANDLE_ELEMENT_COUNT = 64;
+
 bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget,
                      const IR::Block* block);
 
@@ -520,7 +535,41 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
         return true;
     }
     const IR::Inst* const inst{value.InstRecursive()};
+    const size_t node_start{code.size()};
+    const bool is_phi{inst->GetOpcode() == IR::Opcode::Phi};
+    g_handle_element.phi_depth += is_phi ? 1 : 0;
+    SCOPE_EXIT {
+        g_handle_element.phi_depth -= is_phi ? 1 : 0;
+    };
     const auto build = [&](size_t arg) { return BuildHandleProgram(inst->Arg(arg), code, budget, block); };
+    // index * scale or index << scale with an index no draw gives: the array element.
+    const auto element_scale = [&](Op op, size_t index_arg) {
+        HandleElement& element{g_handle_element};
+        const IR::Value index{inst->Arg(index_arg)};
+        const IR::Value scale{inst->Arg(1 - index_arg)};
+        if (!element.allowed || element.load_depth != 1 || element.phi_depth != 0 ||
+            index.IsImmediate() || !scale.IsImmediate()) {
+            return false;
+        }
+        const IR::Inst* const index_inst{index.InstRecursive()};
+        if (index_inst->Type() != IR::Type::U32 || (element.index && element.index != index_inst)) {
+            return false;
+        }
+        element.index = index_inst;
+        code.resize(node_start); // at most the scale, an immediate
+        emit(Op::Element);
+        emit(Op::Immediate);
+        code.push_back(scale.U32());
+        emit(op);
+        return true;
+    };
+    // The byte offset of a load, where an array index may be.
+    const auto build_offset = [&](const IR::Value& offset) {
+        ++g_handle_element.load_depth;
+        const bool built{BuildHandleProgram(offset, code, budget, block)};
+        --g_handle_element.load_depth;
+        return built;
+    };
     const auto binary = [&](Op op) {
         if (!build(0) || !build(1)) return false;
         emit(op);
@@ -552,7 +601,7 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
                 code.push_back(offset.U32() + extra);
                 return true;
             }
-            if (!BuildHandleProgram(offset, code, budget, block)) return false;
+            if (!build_offset(offset)) return false;
             add_extra();
             emit(Op::CbufDynamic);
             code.push_back(index.U32());
@@ -563,7 +612,7 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
         case IR::Opcode::LoadStorage128: {
             const IR::Value binding{source->Arg(0)};
             if (!binding.IsImmediate()) return false;
-            if (!BuildHandleProgram(source->Arg(1), code, budget, block)) return false;
+            if (!build_offset(source->Arg(1))) return false;
             add_extra();
             emit(Op::Storage);
             code.push_back(binding.U32());
@@ -583,7 +632,8 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
     case IR::Opcode::GetCbufU32:
     case IR::Opcode::LoadStorage32:
         return load_word(inst, 0);
-    case IR::Opcode::CompositeExtractU32x2: {
+    case IR::Opcode::CompositeExtractU32x2:
+    case IR::Opcode::CompositeExtractU32x4: {
         const IR::Value element{inst->Arg(1)};
         if (!element.IsImmediate() || inst->Arg(0).IsImmediate()) return false;
         return load_word(inst->Arg(0).InstRecursive(), element.U32() * 4);
@@ -630,11 +680,12 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
     }
     case IR::Opcode::IAdd32: return binary(Op::Add);
     case IR::Opcode::ISub32: return binary(Op::Sub);
-    case IR::Opcode::IMul32: return binary(Op::Mul);
+    case IR::Opcode::IMul32:
+        return binary(Op::Mul) || element_scale(Op::Mul, 0) || element_scale(Op::Mul, 1);
     case IR::Opcode::BitwiseAnd32: return binary(Op::And);
     case IR::Opcode::BitwiseOr32: return binary(Op::Or);
     case IR::Opcode::BitwiseXor32: return binary(Op::Xor);
-    case IR::Opcode::ShiftLeftLogical32: return binary(Op::Shl);
+    case IR::Opcode::ShiftLeftLogical32: return binary(Op::Shl) || element_scale(Op::Shl, 0);
     case IR::Opcode::ShiftRightLogical32: return binary(Op::Shr);
     case IR::Opcode::ShiftRightArithmetic32: return binary(Op::Sar);
     case IR::Opcode::INeg32: return unary(Op::Neg);
@@ -938,7 +989,19 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
             std::vector<u32> code;
             int budget = 4096;
             g_handle_failure = IR::Opcode::Void;
-            if (!g_handle_programs || !BuildHandleProgram(inst.Arg(0), code, budget, block)) {
+            bool built{g_handle_programs && BuildHandleProgram(inst.Arg(0), code, budget, block)};
+            const IR::Inst* element_index{};
+            if (!built && g_handle_programs && !IsStorageImageOpcode(IndexedInstruction(inst))) {
+                // Read at an index the shader computes: an array of handles, one per index.
+                code.clear();
+                budget = 4096;
+                g_handle_element = HandleElement{.allowed = true};
+                built = BuildHandleProgram(inst.Arg(0), code, budget, block) &&
+                        g_handle_element.index != nullptr;
+                element_index = built ? g_handle_element.index : nullptr;
+                g_handle_element = HandleElement{};
+            }
+            if (!built) {
                 // Not computable for a whole draw (a handle that changes in a loop): keep the
                 // earlier search through loads, which at least gives the shader a texture.
                 const std::optional<ConstBufferAddr> legacy{IR::BreadthFirstSearch(inst.Arg(0),
@@ -997,8 +1060,10 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 .secondary_index = 0,
                 .secondary_offset = 0,
                 .secondary_shift_left = 0,
-                .dynamic_offset = {},
-                .count = 1,
+                .dynamic_offset = element_index
+                                      ? IR::U32{IR::Value{const_cast<IR::Inst*>(element_index)}}
+                                      : IR::U32{},
+                .count = element_index ? HANDLE_ELEMENT_COUNT : 1,
                 .has_secondary = false,
                 .handle_program = static_cast<u32>(it - programs.begin()),
             };
@@ -1305,7 +1370,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             break;
         }
         u32 index;
-        u32 size_shift = cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset) : DESCRIPTOR_SIZE_SHIFT;
+        // An array of computed handles is indexed by the element itself.
+        u32 size_shift = cbuf.count > 1 && cbuf.handle_program != ~0U ? 0
+                         : cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset)
+                                          : DESCRIPTOR_SIZE_SHIFT;
         u32 count = cbuf.count;
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageRead:
