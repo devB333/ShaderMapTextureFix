@@ -320,7 +320,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                                       ? cbufs[cbuf].address
                                                       : GPUVAddr{};
                                        },
-                                       storage_buffer_alignment),
+                                       storage_buffer_alignment, index),
                                    via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);

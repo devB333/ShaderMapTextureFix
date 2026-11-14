@@ -423,13 +423,15 @@ enum class HandleOp : u32 {
     Select, ///< condition, true value, false value
     Tee,    ///< slot: keeps the top value in the slot (shared subexpressions)
     Load,   ///< slot: the value kept there
+    Element, ///< the index of the descriptor array element the handle is computed for
 };
 
 /// Runs a handle program; read_cbuf(index, offset) and read_storage(binding, offset) return the
-/// words it reads. Returns nothing for a malformed program.
+/// words it reads, element is the descriptor array element (HandleOp::Element). Returns nothing
+/// for a malformed program.
 template <typename ReadCbuf, typename ReadStorage>
 std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& read_cbuf,
-                                         ReadStorage&& read_storage) {
+                                         ReadStorage&& read_storage, u32 element = 0) {
     std::array<u32, 64> stack{};
     std::array<u32, 256> slots{};
     size_t size = 0;
@@ -442,6 +444,10 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
         const auto operand = [&]() -> u32 { return pc < code.size() ? code[pc++] : 0; };
         if (op == HandleOp::Immediate) {
             push(operand());
+            continue;
+        }
+        if (op == HandleOp::Element) {
+            push(element);
             continue;
         }
         if (op == HandleOp::Cbuf) {
