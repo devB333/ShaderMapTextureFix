@@ -452,14 +452,58 @@ thread_local int g_handle_depth{};
 // (a light's shadow map, read from the light's record in a loop) is still one of an array of
 // handles: the program then computes the handle of one array element, with HandleOp::Element in
 // place of the index. Only an index scaled by a constant into the byte offset of the load the
-// handle comes from is taken, and not through a Phi, whose inputs don't reach the instruction.
+// handle comes from is taken, and only one computed on every path to the instruction (the handle
+// may reach it through Phis: a register other branches used for something else).
 struct HandleElement {
     bool allowed{};
     int load_depth{};
-    int phi_depth{};
     const IR::Inst* index{};
 };
 thread_local HandleElement g_handle_element;
+thread_local const IR::Program* g_handle_ir{}; // the program the pass on this thread works on
+
+// Whether `def` is computed before `use`, an instruction of `use_block`, on every path to it.
+bool Dominates(const IR::Program& program, const IR::Inst* def, const IR::Block* use_block,
+               const IR::Inst* use) {
+    const IR::Block* def_block{};
+    for (const IR::Block* const candidate : program.post_order_blocks) {
+        for (const IR::Inst& inst : candidate->Instructions()) {
+            if (&inst == def) {
+                def_block = candidate;
+                break;
+            }
+        }
+        if (def_block) break;
+    }
+    if (!def_block) {
+        return false;
+    }
+    if (def_block == use_block) {
+        for (const IR::Inst& inst : use_block->Instructions()) {
+            if (&inst == def) return true;
+            if (&inst == use) return false;
+        }
+        return false;
+    }
+    // Not dominated when the entry is reached going back from the use without passing the
+    // definition's block.
+    std::unordered_set<const IR::Block*> visited{use_block};
+    std::vector<const IR::Block*> stack{use_block};
+    while (!stack.empty()) {
+        const IR::Block* const current{stack.back()};
+        stack.pop_back();
+        const auto predecessors{current->ImmPredecessors()};
+        if (predecessors.empty()) {
+            return false;
+        }
+        for (const IR::Block* const predecessor : predecessors) {
+            if (predecessor != def_block && visited.insert(predecessor).second) {
+                stack.push_back(predecessor);
+            }
+        }
+    }
+    return true;
+}
 /// Elements of such an array: the records the shader can tell apart.
 constexpr u32 HANDLE_ELEMENT_COUNT = 64;
 
@@ -536,19 +580,14 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
     }
     const IR::Inst* const inst{value.InstRecursive()};
     const size_t node_start{code.size()};
-    const bool is_phi{inst->GetOpcode() == IR::Opcode::Phi};
-    g_handle_element.phi_depth += is_phi ? 1 : 0;
-    SCOPE_EXIT {
-        g_handle_element.phi_depth -= is_phi ? 1 : 0;
-    };
     const auto build = [&](size_t arg) { return BuildHandleProgram(inst->Arg(arg), code, budget, block); };
     // index * scale or index << scale with an index no draw gives: the array element.
     const auto element_scale = [&](Op op, size_t index_arg) {
         HandleElement& element{g_handle_element};
         const IR::Value index{inst->Arg(index_arg)};
         const IR::Value scale{inst->Arg(1 - index_arg)};
-        if (!element.allowed || element.load_depth != 1 || element.phi_depth != 0 ||
-            index.IsImmediate() || !scale.IsImmediate()) {
+        if (!element.allowed || element.load_depth != 1 || index.IsImmediate() ||
+            !scale.IsImmediate()) {
             return false;
         }
         const IR::Inst* const index_inst{index.InstRecursive()};
@@ -980,26 +1019,87 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
 TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
     ConstBufferAddr addr;
     if (IsBindless(inst)) {
-        const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+        std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+        std::vector<u32> code;
+        int budget = 4096;
+        const IR::Inst* element_index{};
+        // Read at an index the shader computes: an array of handles, one per index.
+        const auto build_array{[&] {
+            if (!g_handle_programs || !g_handle_ir ||
+                IsStorageImageOpcode(IndexedInstruction(inst))) {
+                return false;
+            }
+            code.clear();
+            budget = 4096;
+            g_handle_element = HandleElement{.allowed = true};
+            const bool built{BuildHandleProgram(inst.Arg(0), code, budget, block)};
+            const IR::Inst* const index{g_handle_element.index};
+            g_handle_element = HandleElement{};
+            if (!built || !index || !Dominates(*g_handle_ir, index, block, &inst)) {
+                return false;
+            }
+            element_index = index;
+            return true;
+        }};
+        // A handle that reaches the instruction through Phis may have been tracked to a constant
+        // buffer word only other branches' values of the register lead to.
+        const bool is_array{track_addr && inst.Arg(0).Resolve().IsPhi() && build_array()};
+        if (is_array) {
+            track_addr.reset();
+        }
 
         if (track_addr) {
             addr = *track_addr;
+            // EDEN_NX2_HANDLE_FALLBACK_TRACE=2: also what a tracked handle is computed from.
+            static const bool trace_tracked = [] {
+                const char* const value = std::getenv("EDEN_NX2_HANDLE_FALLBACK_TRACE");
+                return value != nullptr && *value == '2';
+            }();
+            if (trace_tracked) {
+                std::string chain;
+                std::vector<const IR::Inst*> queue;
+                std::unordered_set<const IR::Inst*> seen;
+                if (!inst.Arg(0).IsImmediate()) queue.push_back(inst.Arg(0).InstRecursive());
+                for (size_t i = 0; i < queue.size() && i < 64; ++i) {
+                    const IR::Inst* const node = queue[i];
+                    chain += fmt::format(" [{:p}]{}(", static_cast<const void*>(node), node->GetOpcode());
+                    for (size_t arg = 0; arg < node->NumArgs(); ++arg) {
+                        const IR::Value value = node->Arg(arg);
+                        if (value.IsImmediate()) {
+                            const IR::Type type = value.Type();
+                            if (type == IR::Type::U32 || type == IR::Type::F32) {
+                                chain += fmt::format("{}{:#x}", arg ? "," : "", value.U32());
+                            } else {
+                                chain += fmt::format("{}{}", arg ? "," : "", IR::NameOf(type));
+                            }
+                        } else {
+                            const IR::Inst* const def = value.InstRecursive();
+                            chain += fmt::format("{}{:p}", arg ? "," : "", static_cast<const void*>(def));
+                            if (seen.insert(def).second) queue.push_back(def);
+                        }
+                    }
+                    chain += ")";
+                }
+                // Only a handle some memory load takes part in: the constant buffer word may
+                // then not be the handle.
+                if (std::ranges::any_of(queue, [](const IR::Inst* node) {
+                        return IsMemoryLoad(node->GetOpcode());
+                    }))
+                LOG_WARNING(Shader, "Bindless handle tracked: c{}[{:#x}] shift {} secondary {} c{}[{:#x}] count {}; chain:{}",
+                            addr.index, addr.offset, addr.shift_left, addr.has_secondary,
+                            addr.secondary_index, addr.secondary_offset, addr.count, chain);
+            }
         } else {
             // Read from a storage buffer (a handle table): computed for each draw.
-            std::vector<u32> code;
-            int budget = 4096;
             g_handle_failure = IR::Opcode::Void;
-            bool built{g_handle_programs && BuildHandleProgram(inst.Arg(0), code, budget, block)};
-            const IR::Inst* element_index{};
-            if (!built && g_handle_programs && !IsStorageImageOpcode(IndexedInstruction(inst))) {
-                // Read at an index the shader computes: an array of handles, one per index.
+            bool built{is_array};
+            if (!built) {
                 code.clear();
                 budget = 4096;
-                g_handle_element = HandleElement{.allowed = true};
-                built = BuildHandleProgram(inst.Arg(0), code, budget, block) &&
-                        g_handle_element.index != nullptr;
-                element_index = built ? g_handle_element.index : nullptr;
-                g_handle_element = HandleElement{};
+                built = g_handle_programs && BuildHandleProgram(inst.Arg(0), code, budget, block);
+            }
+            if (!built) {
+                built = build_array();
             }
             if (!built) {
                 // Not computable for a whole draw (a handle that changes in a loop): keep the
@@ -1270,6 +1370,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     env.track_cache.clear();
     TextureInstVector to_replace;
     g_handle_programs = &program.info.handle_programs;
+    g_handle_ir = &program;
     for (IR::Block* const block : program.post_order_blocks) {
         env.track_cache.clear();
         for (IR::Inst& inst : block->Instructions()) {
