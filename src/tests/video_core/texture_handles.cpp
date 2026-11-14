@@ -307,6 +307,108 @@ TEST_CASE("Failed Phi handle subtrees discard their cached values",
 }
 
 namespace {
+// A shadow record's handle as Ocarina of Time reads it: the first word of the record at
+// index * 96 + 0x60, with an index no draw gives (GetRegister stands for it).
+struct RecordHandle {
+    Value index;
+    Value handle;
+
+    explicit RecordHandle(HandleProgram& shader)
+        : index{shader.Emit(Opcode::GetRegister, {Value{IR::Reg::R0}})} {
+        const Value offset{
+            shader.Add(shader.Emit(Opcode::IMul32, {index, Value{96U}}), Value{0x60U})};
+        const Value record{shader.Emit(Opcode::LoadStorage128, {Value{0U}, offset})};
+        handle = shader.Emit(Opcode::CompositeExtractU32x4, {record, Value{0U}});
+    }
+};
+
+// The storage byte offset the handle program reads for an array element.
+u32 ElementOffset(const HandleProgram& shader, const IR::Inst& sample, u32 element) {
+    const u32 program{shader.Descriptor(sample).handle_program};
+    REQUIRE(program < shader.program.info.handle_programs.size());
+    const auto result{Shader::EvaluateHandleProgram(
+        shader.program.info.handle_programs[program],
+        [](u32, u32) -> u32 { throw std::logic_error("Unexpected evaluator cbuf read"); },
+        [](u32 binding, u32 offset) {
+            REQUIRE(binding == 0);
+            return offset;
+        },
+        element)};
+    REQUIRE(result.has_value());
+    return *result;
+}
+
+// What another branch left in the handle's register: a float made from a constant buffer word.
+Value RegisterReuse(HandleProgram& shader) {
+    const Value word{shader.Emit(Opcode::GetCbufU32, {Value{6U}, Value{0x430U}})};
+    const Value number{shader.Emit(Opcode::BitCastF32U32, {word})};
+    return shader.Emit(Opcode::BitCastU32F32, {shader.Emit(Opcode::FPAdd32, {number, number})});
+}
+} // namespace
+
+TEST_CASE("A handle read at a computed record index is an array of handles",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    const RecordHandle record{shader};
+    auto& sample{shader.Sample(record.handle)};
+    shader.Run();
+
+    const auto& descriptor = shader.Descriptor(sample);
+    REQUIRE(descriptor.handle_program != ~0U);
+    CHECK(shader.program.info.handle_programs.size() == 1);
+    REQUIRE(descriptor.count > 1);
+    CHECK(descriptor.size_shift == 0);
+    REQUIRE_FALSE(sample.Arg(0).IsEmpty());
+    const auto* selection = sample.Arg(0).InstRecursive();
+    REQUIRE(selection->GetOpcode() == Opcode::UMin32);
+    CHECK(selection->Arg(1).U32() == descriptor.count - 1);
+    const auto* index = selection->Arg(0).InstRecursive();
+    REQUIRE(index->GetOpcode() == Opcode::ShiftRightLogical32);
+    CHECK(index->Arg(0).Resolve() == record.index.Resolve());
+    CHECK(index->Arg(1).U32() == 0);
+    for (const u32 element : {0U, 2U, 63U}) {
+        CHECK(ElementOffset(shader, sample, element) == element * 96 + 0x60);
+    }
+}
+
+TEST_CASE("A record handle is followed through a Phi instead of another branch's register",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    shader.env.cbuf_values = {{{6, 0x430}, 0x3a83126f}};
+    shader.env.expected_handle = 0x3a83126f;
+    const RecordHandle record{shader};
+    auto& sample{shader.Sample(shader.Phi(record.handle, RegisterReuse(shader)))};
+    shader.Run();
+
+    const auto& descriptor = shader.Descriptor(sample);
+    REQUIRE(descriptor.handle_program != ~0U);
+    REQUIRE(descriptor.count > 1);
+    const auto* selection = sample.Arg(0).InstRecursive();
+    REQUIRE(selection->GetOpcode() == Opcode::UMin32);
+    CHECK(selection->Arg(0).InstRecursive()->Arg(0).Resolve() == record.index.Resolve());
+    CHECK(ElementOffset(shader, sample, 3) == 3 * 96 + 0x60);
+}
+
+TEST_CASE("A record index not computed on every path gives no array of handles",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    shader.env.cbuf_values = {{{6, 0x430}, 0x3a83126f}};
+    shader.env.expected_handle = 0x3a83126f;
+    const Value reuse{RegisterReuse(shader)};
+    shader.insertion_block = &shader.left; // only one branch reads the record
+    const RecordHandle record{shader};
+    auto& sample{shader.Sample(shader.Phi(record.handle, reuse))};
+    shader.Run();
+
+    const auto& descriptor = shader.Descriptor(sample);
+    CHECK(descriptor.handle_program == ~0U);
+    CHECK(descriptor.count == 1);
+    CHECK(descriptor.cbuf_index == 6);
+    CHECK(descriptor.cbuf_offset == 0x430);
+    CHECK(shader.program.info.handle_programs.empty());
+}
+
+namespace {
 struct HandleTestMemory {
     std::map<GPUVAddr, u32> words;
     template <typename T>
@@ -355,6 +457,27 @@ TEST_CASE("Storage handle words are read from the host-aligned buffer base",
         CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 16) == 0x11U);
         CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 4) == 0x22U);
     }
+}
+
+TEST_CASE("An array element's handle is read at the element's own storage offset",
+          "[video_core][texture_handles]") {
+    constexpr GPUVAddr cbuf = 0x1000;
+    HandleTestMemory memory;
+    memory.words[cbuf + 0x10] = 0x2000; // the record buffer
+    memory.words[cbuf + 0x14] = 0;
+    memory.words[0x2000 + 0x60 + 2 * 96] = 0x1a907100; // the handle of record 2
+    memory.words[0x2000 + 0x60 + 3 * 96] = 0x1a902726;
+
+    Shader::Info info;
+    info.storage_buffers_descriptors.push_back({.cbuf_index = 0, .cbuf_offset = 0x10, .count = 1, .is_written = false});
+    using Op = Shader::HandleOp;
+    info.handle_programs.push_back({static_cast<u32>(Op::Element), static_cast<u32>(Op::Immediate), 96U,
+                                    static_cast<u32>(Op::Mul), static_cast<u32>(Op::Immediate), 0x60U,
+                                    static_cast<u32>(Op::Add), static_cast<u32>(Op::Storage), 0U});
+    const auto cbuf_address = [](u32 index) -> GPUVAddr { return index == 0 ? cbuf : 0; };
+    CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 16, 2) == 0x1a907100U);
+    CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 16, 3) == 0x1a902726U);
+    CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 16) == 0U);
 }
 
 TEST_CASE("A texture handle word that holds a storage buffer address is not a handle",
