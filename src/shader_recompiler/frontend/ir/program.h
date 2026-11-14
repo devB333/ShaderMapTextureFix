@@ -27,6 +27,7 @@ struct Program {
     u32 local_memory_size{};
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
+    u64 debug_hash{}; ///< The stage's shader hash, for EDEN_NX2_FRAG_PROBE
     MeshInfo mesh{};
 };
 

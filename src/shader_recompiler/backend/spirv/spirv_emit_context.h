@@ -381,6 +381,9 @@ public:
     std::array<Id, 30> patches{};
 
     std::array<Id, 8> frag_color{};
+    Id frag_probe_var{};
+    Id frag_probe_count{}; ///< EDEN_NX2_FRAG_PROBE's private word, when this program is probed
+    u32 frag_probe_ordinal{};
     Id sample_mask{};
     Id frag_depth{};
 

@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <optional>
 #include <span>
 #include <tuple>
 #include <type_traits>
@@ -15,6 +18,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/frag_probe.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
 
@@ -161,7 +165,147 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+// EDEN_NX2_FRAG_PROBE: records `inst` (already emitted) in the probe word.
+void ProbeInst(EmitContext& ctx, const FragProbe& probe, IR::Inst& inst, std::ofstream& listing) {
+    const IR::Type type{inst.Type()};
+    if (type != IR::Type::F32 && type != IR::Type::U32 && type != IR::Type::U1) {
+        return;
+    }
+    const Id id{inst.Definition<Id>()};
+    if (!Sirit::ValidId(id)) {
+        return;
+    }
+    const u32 ordinal{++ctx.frag_probe_ordinal};
+    if (listing) {
+        listing << ordinal << " %" << id.value << ' ' << IR::NameOf(inst.GetOpcode()) << '\n';
+    }
+    if (probe.mode == FragProbe::Mode::Val || probe.mode == FragProbe::Mode::Flt) {
+        if (ordinal != probe.ordinal) {
+            return;
+        }
+        Id bits{type == IR::Type::F32   ? ctx.OpBitcast(ctx.U32[1], id)
+                : type == IR::Type::U1 ? ctx.OpSelect(ctx.U32[1], id, ctx.Const(1u),
+                                                      ctx.u32_zero_value)
+                                       : id};
+        if (probe.mode == FragProbe::Mode::Flt && type != IR::Type::F32 &&
+            !(probe.integer_bits && type == IR::Type::U32)) {
+            bits = ctx.OpBitcast(ctx.U32[1], ctx.OpConvertUToF(ctx.F32[1], bits));
+        }
+        if (probe.nth != 0) {
+            const Id count{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.frag_probe_count),
+                                      ctx.Const(1u))};
+            ctx.OpStore(ctx.frag_probe_count, count);
+            bits = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, count, ctx.Const(probe.nth)),
+                                bits, ctx.OpLoad(ctx.U32[1], ctx.frag_probe_var));
+        }
+        ctx.OpStore(ctx.frag_probe_var, bits);
+        return;
+    }
+    if (type != IR::Type::F32 || probe.mode == FragProbe::Mode::Class) {
+        return;
+    }
+    const Id magnitude{ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpBitcast(ctx.U32[1], id),
+                                        ctx.Const(0x7fffffffU))};
+    const Id bad{probe.mode == FragProbe::Mode::Nan
+                     ? ctx.OpUGreaterThan(ctx.U1, magnitude, ctx.Const(0x7f800000U))
+                     : ctx.OpIEqual(ctx.U1, magnitude, ctx.Const(0x7f800000U))};
+    const Id current{ctx.OpLoad(ctx.U32[1], ctx.frag_probe_var)};
+    const Id first{ctx.OpIEqual(ctx.U1, current, ctx.u32_zero_value)};
+    ctx.OpStore(ctx.frag_probe_var, ctx.OpSelect(ctx.U32[1], ctx.OpLogicalAnd(ctx.U1, bad, first),
+                                                 ctx.Const(ordinal), current));
+}
+
+// EDEN_NX2_FRAG_PROBE: replaces colour 0 with the diagnosis, before the function returns.
+void EmitProbeOutput(EmitContext& ctx, const FragProbe& probe) {
+    const Id color{ctx.frag_color[0]};
+    const auto store{[&](u32 component, Id value) {
+        ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, color, ctx.Const(component)), value);
+    }};
+    const Id one{ctx.Const(1.0f)};
+    if (probe.mode == FragProbe::Mode::Class) {
+        Id nan{}, inf{}, negative{}, zero{};
+        for (u32 component = 0; component < 3; ++component) {
+            const Id bits{ctx.OpBitcast(
+                ctx.U32[1], ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.output_f32, color,
+                                                                     ctx.Const(component))))};
+            const Id magnitude{ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.Const(0x7fffffffU))};
+            const auto join{[&](Id& all, Id value, bool every) {
+                all = !Sirit::ValidId(all) ? value
+                      : every              ? ctx.OpLogicalAnd(ctx.U1, all, value)
+                                           : ctx.OpLogicalOr(ctx.U1, all, value);
+            }};
+            join(nan, ctx.OpUGreaterThan(ctx.U1, magnitude, ctx.Const(0x7f800000U)), false);
+            join(inf, ctx.OpIEqual(ctx.U1, magnitude, ctx.Const(0x7f800000U)), false);
+            join(negative, ctx.OpUGreaterThan(ctx.U1, bits, ctx.Const(0x80000000U)), false);
+            join(zero, ctx.OpIEqual(ctx.U1, magnitude, ctx.u32_zero_value), true);
+        }
+        // nan magenta, inf yellow, negative cyan, zero red, otherwise green
+        const Id zero_f{ctx.f32_zero_value};
+        const auto pick{[&](Id on_nan, Id on_inf, Id on_negative, Id on_zero, Id otherwise) {
+            Id value{ctx.OpSelect(ctx.F32[1], zero, on_zero, otherwise)};
+            value = ctx.OpSelect(ctx.F32[1], negative, on_negative, value);
+            value = ctx.OpSelect(ctx.F32[1], inf, on_inf, value);
+            return ctx.OpSelect(ctx.F32[1], nan, on_nan, value);
+        }};
+        const Id red{pick(one, one, zero_f, one, zero_f)};
+        const Id green{pick(zero_f, one, one, zero_f, one)};
+        const Id blue{pick(one, zero_f, one, zero_f, zero_f)};
+        store(0, red);
+        store(1, green);
+        store(2, blue);
+    } else if (probe.mode == FragProbe::Mode::Flt) {
+        const Id bits{ctx.OpLoad(ctx.U32[1], ctx.frag_probe_var)};
+        const Id magnitude{ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.Const(0x7fffffffU))};
+        const Id finite{ctx.OpULessThan(ctx.U1, magnitude, ctx.Const(0x7f800000U))};
+        const Id negative{ctx.OpUGreaterThan(ctx.U1, bits, ctx.Const(0x80000000U))};
+        const Id scaled{ctx.OpFMul(ctx.F32[1], ctx.OpBitcast(ctx.F32[1], magnitude),
+                                   ctx.Const(std::ldexp(1.0f, probe.exponent)))};
+        const Id zero_f{ctx.f32_zero_value};
+        const Id shown{ctx.OpSelect(ctx.F32[1], finite, scaled, zero_f)};
+        store(0, ctx.OpSelect(ctx.F32[1], negative, zero_f, shown));
+        store(1, ctx.OpSelect(ctx.F32[1], negative, shown, zero_f));
+        store(2, ctx.OpSelect(ctx.F32[1], finite, zero_f, one));
+    } else {
+        Id word{ctx.OpLoad(ctx.U32[1], ctx.frag_probe_var)};
+        if (probe.mode == FragProbe::Mode::Val && probe.shift != 0) {
+            word = ctx.OpShiftRightLogical(ctx.U32[1], word, ctx.Const(probe.shift));
+        }
+        for (u32 component = 0; component < 3; ++component) {
+            const Id digit{ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], word, ctx.Const(component * 5)),
+                ctx.Const(31u))};
+            store(component, ctx.OpFMul(ctx.F32[1], ctx.OpConvertUToF(ctx.F32[1], digit),
+                                        ctx.Const(1.0f / 32.0f)));
+        }
+    }
+    store(3, one);
+}
+
 void Traverse(EmitContext& ctx, IR::Program& program) {
+    const std::optional<FragProbe> current_probe{
+        program.stage == Stage::Fragment ? GetFragProbe() : std::nullopt};
+    const FragProbe* probe{current_probe ? &*current_probe : nullptr};
+    if (probe && (probe->hash != program.debug_hash || !Sirit::ValidId(ctx.frag_color[0]) ||
+                  ctx.runtime_info.color_output_types[0] != AttributeType::Float)) {
+        probe = nullptr;
+    }
+    std::ofstream listing;
+    boost::container::small_vector<IR::Inst*, 16> probe_phis;
+    if (probe) {
+        ctx.frag_probe_var =
+            ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1]),
+                                  spv::StorageClass::Private, ctx.u32_zero_value);
+        ctx.frag_probe_count =
+            ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1]),
+                                  spv::StorageClass::Private, ctx.u32_zero_value);
+        if (ctx.profile.supported_spirv >= 0x00010400) {
+            ctx.interfaces.push_back(ctx.frag_probe_var);
+            ctx.interfaces.push_back(ctx.frag_probe_count);
+        }
+        if (!probe->directory.empty()) {
+            listing.open(fmt::format("{}/frag_probe_{:016x}.txt", probe->directory, probe->hash));
+        }
+    }
     IR::Block* current_block{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
@@ -174,7 +318,24 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             ctx.AddLabel(label);
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
+                if (!probe) {
+                    continue;
+                }
+                // Nothing may be emitted between a block's phi nodes.
+                if (inst.GetOpcode() == IR::Opcode::Phi) {
+                    probe_phis.push_back(&inst);
+                    continue;
+                }
+                for (IR::Inst* const phi : probe_phis) {
+                    ProbeInst(ctx, *probe, *phi, listing);
+                }
+                probe_phis.clear();
+                ProbeInst(ctx, *probe, inst, listing);
             }
+            for (IR::Inst* const phi : probe_phis) {
+                ProbeInst(ctx, *probe, *phi, listing);
+            }
+            probe_phis.clear();
             break;
         }
         case IR::AbstractSyntaxNode::Type::If: {
@@ -227,6 +388,9 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             break;
         }
         case IR::AbstractSyntaxNode::Type::Return:
+            if (probe) {
+                EmitProbeOutput(ctx, *probe);
+            }
             ctx.OpReturn();
             break;
         case IR::AbstractSyntaxNode::Type::Unreachable:
@@ -671,6 +835,13 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     SetupTransformFeedbackCapabilities(ctx, main);
     PatchPhiNodes(program, ctx);
     std::vector<u32> code{ctx.Assemble()};
+    if (const std::optional<FragProbe> probe{GetFragProbe()};
+        probe && Sirit::ValidId(ctx.frag_probe_var) && !probe->directory.empty()) {
+        std::ofstream file{fmt::format("{}/frag_probe_{:016x}.spv", probe->directory, probe->hash),
+                           std::ios::binary};
+        file.write(reinterpret_cast<const char*>(code.data()),
+                   static_cast<std::streamsize>(code.size() * sizeof(u32)));
+    }
     RewriteOpcodes(code, ctx.opcode_rewrites);
     PatchMeshInstructions(code, ctx);
     if (ctx.cooperative_hmma) {

@@ -45,6 +45,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frag_probe.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/info_serialize.h"
@@ -1042,7 +1043,12 @@ int PrecompiledFastMode() {
         // cache, precompile + fast path vs precompile only: GPU-thread pipeline time 3133 -> 44 ms,
         // translation 1884 -> 2 ms, load 75 -> 58 s; audit 989 compared, 0 differ; index 10.2 MB,
         // working set 11.6 -> 11.3 GB. =0 off, =2 audit.
-        const int parsed = value == nullptr ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+        // EDEN_NX2_FRAG_PROBE changes a shader's SPIR-V, which the kept one would not have.
+        const int parsed = Shader::FragProbeEnabled()        ? 0
+                           : value == nullptr                ? 1
+                           : value[0] == '0'                 ? 0
+                           : value[0] == '2'                 ? 2
+                                                             : 1;
         if (parsed != 0) {
             LOG_INFO(Render_Vulkan,
                      "EDEN_NX2_PRECOMPILED_FAST={}: precompiled pipelines are drawn from the "
@@ -5833,6 +5839,34 @@ void PipelineCache::TickFrame() {
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {
         retired_compute_pipelines.pop_front();
     }
+    if (Shader::FragProbeEnabled() && frame_count % 30 == 0) {
+        // EDEN_NX2_FRAG_PROBE changed in probe.txt: the shaders it names are translated again.
+        const std::vector<u64> hashes{Shader::PollFragProbe()};
+        const u64 tick = scheduler.CurrentTick();
+        bool dropped = false;
+        for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
+            const auto& stages{it->first.unique_hashes};
+            if (!it->second || std::ranges::none_of(hashes, [&](u64 hash) {
+                    return std::ranges::find(stages, hash) != stages.end();
+                })) {
+                ++it;
+                continue;
+            }
+            used_this_session.erase(it->second.get());
+            evicted_pipelines.emplace_back(tick, std::move(it->second));
+            it = graphics_cache.erase(it);
+            dropped = true;
+        }
+        if (dropped) {
+            for (auto& [key, pipeline] : graphics_cache) {
+                if (pipeline) {
+                    pipeline->ClearTransitions();
+                }
+            }
+            current_pipeline = nullptr;
+            clean.pipeline = nullptr;
+        }
+    }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
@@ -6562,6 +6596,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         UNIMPLEMENTED_IF(index == 0);
 
         Shader::IR::Program& program{programs[index]};
+        program.debug_hash = key.unique_hashes[index];
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
