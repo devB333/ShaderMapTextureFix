@@ -89,7 +89,7 @@ jobs:
             -DUSE_CCACHE=ON
 
       - name: Build production and tests
-        run: cmake --build build --parallel 4
+        run: cmake --build build --parallel 4 -- -k 0
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure --no-tests=error
