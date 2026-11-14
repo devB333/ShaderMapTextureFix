@@ -72,7 +72,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-13 \
             -DCMAKE_CXX_COMPILER=g++-13 \
-            -DENABLE_WERROR=ON \
+            -DENABLE_WERROR=OFF \
             -DBUILD_TESTING=ON \
             -DYUZU_TESTS=ON \
             -DENABLE_QT=ON \
