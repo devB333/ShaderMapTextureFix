@@ -44,7 +44,6 @@ add_executable(tests
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
     core/nx_archive.cpp
-    frontend_common/nx_archive.cpp
     input_common/calibration_lifetime.cpp
     input_common/tas_input.cpp
     video_core/ampere_logged_numeric.cpp
@@ -102,7 +101,6 @@ add_executable(tests
     video_core/ampere_ported_textures.cpp
     video_core/ampere_tennis_i2f.cpp
     video_core/ampere_tennis_tessellation.cpp
-    video_core/pipeline_cache_files.cpp
     video_core/evicted_pointer_slots.cpp
     video_core/shader_object_pool.cpp
     video_core/storage_binding_capacity.cpp

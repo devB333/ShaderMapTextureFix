@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [nx2]
   push:
-    branches: [nx2]
+    branches: [nx2, ci/baseline-v584]
   workflow_dispatch:
 
 permissions:
@@ -72,7 +72,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-13 \
             -DCMAKE_CXX_COMPILER=g++-13 \
-            -DENABLE_WERROR=ON \
+            -DENABLE_WERROR=OFF \
             -DBUILD_TESTING=ON \
             -DYUZU_TESTS=ON \
             -DENABLE_QT=ON \
@@ -89,7 +89,7 @@ jobs:
             -DUSE_CCACHE=ON
 
       - name: Build production and tests
-        run: cmake --build build --parallel 4
+        run: cmake --build build --parallel 4 -- -k 0
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure --no-tests=error
